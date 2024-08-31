@@ -1,9 +1,11 @@
 #include "elf_util.hpp"
 
 #include <cstring>
+#include <tuple>
 #include <type_traits>
 #include <vector>
-#include <tuple>
+
+#include "logging.hpp"
 
 #if defined(__arm__)
 #define ELF_R_GENERIC_JUMP_SLOT R_ARM_JUMP_SLOT  //.rel.plt
@@ -44,11 +46,13 @@ inline constexpr auto OffsetOf(ElfW(Ehdr) * head, ElfW(Off) off) {
 
 template <typename T>
 inline constexpr auto SetByOffset(T &ptr, ElfW(Addr) base, ElfW(Addr) bias, ElfW(Addr) off) {
+    LOGD("SetByOffset %llx, %llx, %llx", base, bias, off);
     if (auto val = bias + off; val > base) {
         ptr = reinterpret_cast<T>(val);
         return true;
     }
     ptr = 0;
+    LOGW("ptr set to 0");
     return false;
 }
 
@@ -114,6 +118,7 @@ Elf::Elf(uintptr_t base_addr) : base_addr_(base_addr) {
 
     for (auto *dynamic = dynamic_, *dynamic_end = dynamic_ + (dynamic_size_ / sizeof(dynamic[0]));
          dynamic < dynamic_end; ++dynamic) {
+        LOGV("Looping over tag: %lld", dynamic->d_tag);
         switch (dynamic->d_tag) {
         case DT_NULL:
             // the end of the dynamic-section
@@ -267,9 +272,18 @@ std::vector<uintptr_t> Elf::FindPltAddr(std::string_view name) const {
     std::vector<uintptr_t> res;
 
     uint32_t idx = GnuLookup(name);
-    if (!idx) idx = ElfLookup(name);
-    if (!idx) idx = LinearLookup(name);
-    if (!idx) return res;
+    if (!idx) {
+        LOGD("GnuLookup missed %s", name.data());
+        idx = ElfLookup(name);
+    }
+    if (!idx) {
+        LOGD("ElfLookup missed %s", name.data());
+        idx = LinearLookup(name);
+    }
+    if (!idx) {
+        LOGD("LinearLookup missed %s", name.data());
+        return res;
+    }
 
     auto looper = [&]<typename T>(auto begin, auto size, bool is_plt) -> void {
         const auto *rel_end = reinterpret_cast<const T *>(begin + size);
@@ -279,12 +293,23 @@ std::vector<uintptr_t> Elf::FindPltAddr(std::string_view name) const {
             auto r_sym = ELF_R_SYM(r_info);
             auto r_type = ELF_R_TYPE(r_info);
             if (r_sym != idx) continue;
-            if (is_plt && r_type != ELF_R_GENERIC_JUMP_SLOT) continue;
+            if (is_plt && r_type != ELF_R_GENERIC_JUMP_SLOT) {
+                LOGD("Ignore addr %llx in plt: r_type %llu != ELF_R_GENERIC_JUMP_SLOT",
+                     bias_addr_ + r_offset, r_type);
+                continue;
+            }
             if (!is_plt && r_type != ELF_R_GENERIC_ABS && r_type != ELF_R_GENERIC_GLOB_DAT) {
+                LOGD(
+                    "Ignore addr %llx: r_type %llu != ELF_R_GENERIC_ABS nor ELF_R_GENERIC_GLOB_DAT",
+                    bias_addr_ + r_offset, r_type);
                 continue;
             }
             auto addr = bias_addr_ + r_offset;
-            if (addr > base_addr_) res.emplace_back(addr);
+            if (addr > base_addr_) {
+                res.emplace_back(addr);
+            } else {
+                LOGD("addr %llx less than base_addr_ %llx", addr, base_addr_);
+            }
             if (is_plt) break;
         }
     };
@@ -293,7 +318,10 @@ std::vector<uintptr_t> Elf::FindPltAddr(std::string_view name) const {
          {std::make_tuple(rel_plt_, rel_plt_size_, true),
           std::make_tuple(rel_dyn_, rel_dyn_size_, false),
           std::make_tuple(rel_android_, rel_android_size_, false)}) {
-        if (!rel) continue;
+        LOGV("Looping tuple: %llx, %u, %i", rel, rel_size, is_plt);
+        if (!rel) {
+            continue;
+        }
         if (is_use_rela_) {
             looper.template operator()<ElfW(Rela)>(rel, rel_size, is_plt);
         } else {

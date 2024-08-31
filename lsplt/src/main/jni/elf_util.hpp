@@ -5,7 +5,6 @@
 #include <vector>
 
 class Elf {
-    ElfW(Addr) base_addr_ = 0;
     ElfW(Addr) bias_addr_ = 0;
 
     ElfW(Ehdr) *header_ = nullptr;
@@ -37,13 +36,15 @@ class Elf {
     uint32_t bloom_size_ = 0;
     uint32_t bloom_shift_ = 0;
 
-    bool is_use_rela_ = false;
     bool valid_ = false;
 
     uint32_t GnuLookup(std::string_view name) const;
     uint32_t ElfLookup(std::string_view name) const;
     uint32_t LinearLookup(std::string_view name) const;
 public:
+    ElfW(Addr) base_addr_ = 0;
+    bool is_use_rela_ = false;
+
     std::vector<uintptr_t> FindPltAddr(std::string_view name) const;
     Elf(uintptr_t base_addr);
     bool Valid() const { return valid_; };

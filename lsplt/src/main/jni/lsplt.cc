@@ -18,7 +18,8 @@ namespace {
 const uintptr_t kPageSize = getpagesize();
 
 inline auto PageStart(uintptr_t addr) {
-    return reinterpret_cast<char *>(addr / kPageSize * kPageSize); }
+    return reinterpret_cast<char *>(addr / kPageSize * kPageSize);
+}
 
 inline auto PageEnd(uintptr_t addr) {
     return reinterpret_cast<char *>(reinterpret_cast<uintptr_t>(PageStart(addr)) + kPageSize);
@@ -168,7 +169,8 @@ public:
             LOGD("Restore %p from %p", reinterpret_cast<void *>(info.start),
                  reinterpret_cast<void *>(info.backup));
             // Note that we have to always use sys_mremap here,
-            // see https://cs.android.com/android/_/android/platform/bionic/+/4200e260d266fd0c176e71fbd720d0bab04b02db
+            // see
+            // https://cs.android.com/android/_/android/platform/bionic/+/4200e260d266fd0c176e71fbd720d0bab04b02db
             if (auto *new_addr =
                     sys_mremap(reinterpret_cast<void *>(info.backup), len, len,
                                MREMAP_FIXED | MREMAP_MAYMOVE, reinterpret_cast<void *>(info.start));
@@ -192,7 +194,8 @@ public:
                 }
                 if (!info.elf) info.elf = std::make_unique<Elf>(info.start);
                 if (info.elf && info.elf->Valid()) {
-                    LOGD("Hooking %s", iter->symbol.data());
+                    LOGD("Finding plt_addr %s at %llx%s using rela", iter->symbol.data(),
+                         info.elf->base_addr_, info.elf->is_use_rela_ ? "" : "not");
                     for (auto addr : info.elf->FindPltAddr(reg.symbol)) {
                         res = DoHook(addr, reinterpret_cast<uintptr_t>(reg.callback),
                                      reinterpret_cast<uintptr_t *>(reg.backup)) &&
