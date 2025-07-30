@@ -26,7 +26,52 @@ inline auto PageEnd(uintptr_t addr) {
     return reinterpret_cast<char *>(reinterpret_cast<uintptr_t>(PageStart(addr)) + page_size);
 }
 
-struct RegisterInfo {
+/*
+ * =======================================================================================
+ *                            High-Level Data Flow Diagram
+ * =======================================================================================
+ *
+ * This diagram shows the journey from a user's hook request to the final state
+ * managed by the global 'hook_info' object.
+ *
+ *
+ *  +-----------------------------+
+ *  | 1. User's Hook Requests     |
+ *  | (std::vector<HookRequest>) |
+ *  |                             |
+ *  | [dev, inode, "read",  cb1]  |
+ *  | [dev, inode, "write", cb2]  |
+ *  +-------------+---------------+
+ *                |
+ *                |
+ *                v
+ *  +-------------+---------------+      +--------------------------------+
+ *  | 2. CommitHook()             |      | /proc/self/maps                |
+ *  |                             +<-----+ (Scanned to find loaded libs)  |
+ *  |   - ScanHookInfo()          |      +--------------------------------+
+ *  |   - Filter()                |
+ *  |   - Merge()                 |
+ *  |   - DoHook()                |
+ *  +-------------+---------------+
+ *                |
+ *                |
+ *                v
+ *  +---------------------------------------------------------------------------------+
+ *  | 3. Global State: 'hook_info' (HookInfos -> std::map<start_addr, HookInfo>)      |
+ *  |                                                                                 |
+ *  |  Key (start_addr)     Value (HookInfo Object)                                   |
+ *  | +------------------+----------------------------------------------------------+ |
+ *  | | 0x7f... (libc)   | HookInfo for libc (Contains active hook details)         | |
+ *  | +------------------+----------------------------------------------------------+ |
+ *  | | 0x7f... (ld.so)  | HookInfo for ld.so (No matching hooks, may be empty)     | |
+ *  | +------------------+----------------------------------------------------------+ |
+ *  | | ...              | ...                                                      | |
+ *  | +------------------+----------------------------------------------------------+ |
+ *  +---------------------------------------------------------------------------------+
+ *
+ */
+
+struct HookRequest {
     dev_t dev;
     ino_t inode;
     std::pair<uintptr_t, uintptr_t> offset_range;
@@ -35,12 +80,82 @@ struct RegisterInfo {
     void **backup;
 };
 
+/*
+ * =======================================================================================
+ *               Detailed `HookInfo` Structure Diagram (Focus on 'backup')
+ * =======================================================================================
+ *
+ * This shows the contents of a single `HookInfo` object for a library (e.g., libc.so.6)
+ * where one or more hooks are active. The 'backup' field is central to this state.
+ *
+ *
+ *  HookInfo for libc.so.6 (Address: 0x7fABC000)
+ * +--------------------------------------------------------------------+
+ * |                                                                    |
+ * |  //-- MapInfo fields --//                                          |
+ * |  path:  "/usr/lib/libc.so.6"                                       |
+ * |  inode: 12345                                                      |
+ * |  ...                                                               |
+ * |                                                                    |
+ * |  //-- Hooking State --//                                           |
+ * |                                                                    |
+ * |  elf:  std::unique_ptr<Elf> (points to parsed ELF data)            |
+ * |                                                                    |
+ * |  backup: 0xBAADF00D ---------------------------------------------+ |
+ * |       ^                                                            |
+ * |       |---- (See full explanation of its roles below) -----------+ |
+ * |                                                                    |
+ * |  hooks: std::map<uintptr_t, uintptr_t>                             |
+ * |        (A record of every active hook in this library)             |
+ * |        +-----------------------------+---------------------------+ |
+ * |        | Key (Address of PLT entry)  | Value (Original Func Ptr) | |
+ * |        +-----------------------------+---------------------------+ |
+ * |        | 0x7fABC100 (plt for "read") | 0x7fDEF100 (real_read)    | |
+ * |        +-----------------------------+---------------------------+ |
+ * |        | 0x7fABC240 (plt for "write")| 0x7fDEF200 (real_write)   | |
+ * |        +-----------------------------+---------------------------+ |
+ * |                                                                    |
+ * +--------------------------------------------------------------------+
+ *
+ *
+ * =======================================================================================
+ *                   The Three Critical Roles of the `backup` Field
+ * =======================================================================================
+ *
+ * The `backup` field is more than just a pointer; it's a state machine that governs the
+ * entire lifecycle of a hooked library.
+ *
+ * 1. IT ACTS AS A STATE FLAG:
+ *    - If `backup == 0`, it means this library is NOT hooked. The memory at its original
+ *      address is the pristine, read-only version from the file on disk.
+ *    - If `backup != 0`, it means the library IS actively hooked. It tells us:
+ *        a) A writable, private copy of the library now exists at the original address.
+ *        b) The pristine, original, read-only memory has been moved to the address
+ *           stored in the `backup` field.
+ *
+ * 2. IT IS THE SOURCE FOR THE FINAL RESTORATION:
+ *    - This is its most important role. When the VERY LAST hook is removed from this
+ *      library, the `hooks` map becomes empty.
+ *    - This emptiness triggers a final `sys_mremap` call that MOVES the pristine memory
+ *      segment from the `backup` address BACK to the library's original address.
+ *    - This atomically and efficiently restores the library to its exact pre-hook state,
+ *      destroying the writable copy and cleaning up all modifications.
+ *
+ * 3. IT IS THE SOURCE FOR THE INITIAL COPY:
+ *    - When the first hook is applied, the kernel first moves the original memory to the
+ *      `backup` address.
+ *    - The code then immediately `memcpy`s the content FROM this `backup` location TO the
+ *      newly created writable mapping at the original address. This populates our
+ *      writable "sandbox" with the library's original code.
+ *
+ */
+
 struct HookInfo : public lsplt::MapInfo {
     std::map<uintptr_t, uintptr_t> hooks;
     uintptr_t backup;
     std::unique_ptr<Elf> elf;
     bool self;
-    [[nodiscard]] bool Match(const RegisterInfo &info) const {
+    [[nodiscard]] bool Match(const HookRequest &info) const {
         return info.dev == dev && info.inode == inode && offset >= info.offset_range.first &&
                offset < info.offset_range.second;
     }
@@ -48,7 +163,7 @@ struct HookInfo : public lsplt::MapInfo {
 
 class HookInfos : public std::map<uintptr_t, HookInfo, std::greater<>> {
 public:
-    static auto ScanHookInfo(std::vector<lsplt::MapInfo> maps) {
+    static auto CreateTargetsFromMemoryMaps(std::vector<lsplt::MapInfo> maps) {
         static ino_t kSelfInode = 0;
         static dev_t kSelfDev = 0;
         HookInfos info;
@@ -80,7 +195,7 @@ public:
     }
 
     // filter out ignored
-    void Filter(const std::vector<RegisterInfo> &register_info) {
+    void Filter(const std::vector<HookRequest> &register_info) {
         for (auto iter = begin(); iter != end();) {
             const auto &info = iter->second;
             bool matched = false;
@@ -116,7 +231,76 @@ public:
         }
     }
 
-    bool DoHook(uintptr_t addr, uintptr_t callback, uintptr_t *backup) {
+    /**
+     * =======================================================================================
+     *                      Memory Remapping and Hooking Mechanism
+     * =======================================================================================
+     *
+     * The following diagram illustrates the state of a process's address space before
+     * and after hooking an PLT entry.
+     *
+     *
+     * A) BEFORE HOOKING
+     * -----------------
+     * The library exists as a single, read-only, file-backed mapping.
+     *
+     *    Address Space
+     *  +------------------+
+     *  | ...              |
+     *  +------------------+
+     *  | 0x7f1000         | <-- Original R/O mapping of libc.so
+     *  |  .text, .got.plt |
+     *  |  [PLT for 'read']| --> Points to original 'read' implementation.
+     *  +------------------+
+     *  | ...              |
+     *  +------------------+
+     *
+     *
+     * B) AFTER HOOKING
+     * ----------------
+     * The memory layout is rearranged into two distinct segments.
+     *
+     *    Address Space
+     *  +------------------+
+     *  | ...              |
+     *  +------------------+
+     *  | 0x7f1000         | <-- (3) New R/W private anonymous mapping.
+     *  |  .text, .got.plt |     This is a mutable copy of the original.
+     *  |  [PLT for 'read']| --> OVERWRITTEN to point to our callback function.
+     *  +------------------+
+     *  | ...              |
+     *  +------------------+
+     *  | 0xBAADF00D       | <-- (1) Original mapping, moved here via mremap.
+     *  |  (Backup Address)|     It remains an unmodified, R/O program image.
+     *  |  [PLT for 'read']| --> Still points to original 'read'.
+     *  +------------------+
+     *  | ...              |
+     *  +------------------+
+     *
+     *
+     * Sequence of Operations (Referenced in Diagram B):
+     * -------------------------------------------------
+     * 1. MREMAP: The original, file-backed memory segment at `0x7f1000` is atomically
+     *    moved to a new, kernel-selected address (`0xBAADF00D`). This becomes the backup.
+     *    The `HookInfo.backup` field records this new address.
+     *
+     * 2. MMAP & MEMCPY: A new, writable, private anonymous mapping is created at the
+     *    original address (`0x7f1000`). Its contents are immediately populated by copying
+     *    the data from the backup segment.
+     *
+     * 3. OVERWRITE: With a writable copy now in place, the PLT entry for the target
+     *    symbol ('read') is safely overwritten with the address of the user's callback.
+     *
+     * Restoration:
+     * ------------
+     * When the last hook is removed, this process is efficiently reversed. A single
+     * `sys_mremap` call moves the unmodified backup segment from `0xBAADF00D` back to
+     * `0x7f1000`, completely discarding the modified, anonymous copy and restoring the
+     * process's memory to its original state.
+     *
+     */
+
+    bool PatchPLTEntry(uintptr_t addr, uintptr_t callback, uintptr_t *backup) {
         LOGV("Hooking %p", reinterpret_cast<void *>(addr));
         auto iter = lower_bound(addr);
         if (iter == end()) return false;
@@ -134,7 +318,7 @@ public:
                                MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP, backup_addr);
                 new_addr == MAP_FAILED || new_addr != backup_addr) {
                 new_addr = sys_mremap(reinterpret_cast<void *>(info.start), len, len,
-                           MREMAP_FIXED | MREMAP_MAYMOVE, backup_addr);
+                                      MREMAP_FIXED | MREMAP_MAYMOVE, backup_addr);
                 if (new_addr == MAP_FAILED || new_addr != backup_addr) {
                     return false;
                 }
@@ -150,8 +334,8 @@ public:
             for (uintptr_t src = reinterpret_cast<uintptr_t>(backup_addr), dest = info.start,
                            end = info.start + len;
                  dest < end; src += page_size, dest += page_size) {
-                LOGD("memcpy %p to %p: %zu", reinterpret_cast<void *>(src),
-                     reinterpret_cast<void *>(dest), page_size);
+                // LOGD("memcpy %p to %p: %zu", reinterpret_cast<void *>(src),
+                //      reinterpret_cast<void *>(dest), page_size);
                 memcpy(reinterpret_cast<void *>(dest), reinterpret_cast<void *>(src), page_size);
             }
             info.backup = reinterpret_cast<uintptr_t>(backup_addr);
@@ -191,7 +375,62 @@ public:
         return true;
     }
 
-    bool DoHook(std::vector<RegisterInfo> &register_info) {
+    /**
+     * ------------------------------------------------------------------
+     *                    Direct Hook Restoration Logic
+     * ------------------------------------------------------------------
+     * This block handles the restoration of a previously applied hook.
+     * It operates under the efficient assumption that a corresponding
+     * hook is already active within this `HookInfo`'s cache.
+     *
+     * The strategy is as follows:
+     *
+     * 1. IDENTIFY THE HOOK FROM CACHE: We iterate through the `info.hooks` map.
+     *    This map's `key` is the memory address of the hooked PLT entry,
+     *    and its `value` is the original function pointer we saved.
+     *
+     * 2. IDENTIFICATION CRITERION: A hook is identified as the correct one
+     *    to restore if the original function address (the value) matches the
+     *    `callback` pointer from the user's restore request (`reg.callback`).
+     *
+     * 3. RESTORE VIA DoHook: Once the match is found, we call the low-level
+     *    `DoHook` function, passing the following parameters:
+     *      - 1st arg: `hooked_addr` (the destination PLT entry address)
+     *      - 2nd arg: `original_addr` (the source value from our cache)
+     *    This writes the original function pointer back, undoing the hook.
+     */
+    bool RestoreFunction(std::vector<HookRequest> &register_info) {
+        LOGV("Restoring %zu functions", register_info.size());
+        bool res = false;
+        for (auto &reg : register_info) {
+            bool restored = false;
+            for (auto info_iter = rbegin(); info_iter != rend(); ++info_iter) {
+                auto &info = info_iter->second;
+                if (info.hooks.size() == 0 || info.dev != reg.dev || info.inode != reg.inode) {
+                    continue;
+                }
+                for (const auto &[hooked_addr, original_addr] : info.hooks) {
+                    // The `hooked_addr` is the Key: the address of the PLT entry.
+                    // The `original_addr` is the Value: the original function ptr we backed up.
+                    if (original_addr == reinterpret_cast<uintptr_t>(reg.callback)) {
+                        LOGD("Found matching hook for symbol [%s] at address %p.",
+                             reg.symbol.c_str(), reinterpret_cast<void *>(hooked_addr));
+                        restored = PatchPLTEntry(hooked_addr, original_addr, nullptr);
+                        res = restored && res;
+                        break;
+                    }
+                }
+            }
+
+            if (!restored) {
+                LOGW("No matched hook found to restore function [%s]", reg.symbol.c_str());
+            }
+        }
+
+        return res;
+    }
+
+    bool ProcessRequest(std::vector<HookRequest> &register_info) {
         bool res = true;
         for (auto info_iter = rbegin(); info_iter != rend(); ++info_iter) {
             auto &info = info_iter->second;
@@ -201,12 +440,13 @@ public:
                     ++iter;
                     continue;
                 }
+
                 if (!info.elf) info.elf = std::make_unique<Elf>(info.start);
                 if (info.elf && info.elf->Valid()) {
                     LOGD("Hooking %s", iter->symbol.data());
                     for (auto addr : info.elf->FindPltAddr(reg.symbol)) {
-                        res = DoHook(addr, reinterpret_cast<uintptr_t>(reg.callback),
-                                     reinterpret_cast<uintptr_t *>(reg.backup)) &&
+                        res = PatchPLTEntry(addr, reinterpret_cast<uintptr_t>(reg.callback),
+                                            reinterpret_cast<uintptr_t *>(reg.backup)) &&
                               res;
                     }
                 }
@@ -216,7 +456,7 @@ public:
         return res;
     }
 
-    bool InvalidateBackup() {
+    bool CleanupAllHooks() {
         bool res = true;
         for (auto &[_, info] : *this) {
             if (!info.backup) continue;
@@ -246,9 +486,9 @@ public:
     }
 };
 
-std::mutex hook_mutex;
-std::vector<RegisterInfo> register_info = {};
-HookInfos hook_info;
+std::mutex g_hook_state_mutex;
+std::vector<HookRequest> g_pending_hooks = {};
+HookInfos g_global_hook_state;
 }  // namespace
 
 namespace lsplt::inline v2 {
@@ -295,10 +535,10 @@ namespace lsplt::inline v2 {
                                    void **backup) {
     if (dev == 0 || inode == 0 || symbol.empty() || !callback) return false;
 
-    const std::unique_lock lock(hook_mutex);
+    const std::unique_lock lock(g_hook_state_mutex);
     static_assert(std::numeric_limits<uintptr_t>::min() == 0);
     static_assert(std::numeric_limits<uintptr_t>::max() == -1);
-    [[maybe_unused]] const auto &info = register_info.emplace_back(
+    [[maybe_unused]] const auto &info = g_pending_hooks.emplace_back(
         dev, inode,
         std::pair{std::numeric_limits<uintptr_t>::min(), std::numeric_limits<uintptr_t>::max()},
         std::string{symbol}, callback, backup);
@@ -311,10 +551,10 @@ namespace lsplt::inline v2 {
                                    std::string_view symbol, void *callback, void **backup) {
     if (dev == 0 || inode == 0 || symbol.empty() || !callback) return false;
 
-    const std::unique_lock lock(hook_mutex);
+    const std::unique_lock lock(g_hook_state_mutex);
     static_assert(std::numeric_limits<uintptr_t>::min() == 0);
     static_assert(std::numeric_limits<uintptr_t>::max() == -1);
-    [[maybe_unused]] const auto &info = register_info.emplace_back(
+    [[maybe_unused]] const auto &info = g_pending_hooks.emplace_back(
         dev, inode, std::pair{offset, offset + size}, std::string{symbol}, callback, backup);
 
     LOGV("RegisterHook %lu %" PRIxPTR "-%" PRIxPTR " %s", info.inode, info.offset_range.first,
@@ -322,20 +562,23 @@ namespace lsplt::inline v2 {
     return true;
 }
 
-[[maybe_unused]] bool CommitHook(std::vector<lsplt::MapInfo> &maps) {
-    const std::unique_lock lock(hook_mutex);
-    if (register_info.empty()) return true;
+[[maybe_unused]] bool CommitHook(std::vector<lsplt::MapInfo> &maps, bool unhook) {
+    const std::unique_lock lock(g_hook_state_mutex);
+    if (g_pending_hooks.empty()) return true;
 
-    auto new_hook_info = HookInfos::ScanHookInfo(maps);
-    if (new_hook_info.empty()) return false;
+    auto new_hook_state = HookInfos::CreateTargetsFromMemoryMaps(maps);
+    if (new_hook_state.empty()) return false;
 
-    new_hook_info.Filter(register_info);
+    new_hook_state.Filter(g_pending_hooks);
 
-    new_hook_info.Merge(hook_info);
+    new_hook_state.Merge(g_global_hook_state);
     // update to new map info
-    hook_info = std::move(new_hook_info);
+    g_global_hook_state = std::move(new_hook_state);
 
-    return hook_info.DoHook(register_info);
+    if (unhook && g_global_hook_state.RestoreFunction(g_pending_hooks)) {
+        return true;
+    }
+    return g_global_hook_state.ProcessRequest(g_pending_hooks);
 }
 
 [[maybe_unused]] bool CommitHook() {
@@ -344,7 +587,7 @@ namespace lsplt::inline v2 {
 }
 
 [[gnu::destructor]] [[maybe_unused]] bool InvalidateBackup() {
-    const std::unique_lock lock(hook_mutex);
-    return hook_info.InvalidateBackup();
+    const std::unique_lock lock(g_hook_state_mutex);
+    return g_global_hook_state.CleanupAllHooks();
 }
 }  // namespace lsplt::inline v2
