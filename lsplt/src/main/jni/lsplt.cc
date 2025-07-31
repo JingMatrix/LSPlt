@@ -401,7 +401,7 @@ public:
      */
     bool RestoreFunction(std::vector<HookRequest> &register_info) {
         LOGV("Restoring %zu functions", register_info.size());
-        bool res = false;
+        bool res = true;
         for (auto &reg : register_info) {
             bool restored = false;
             for (auto info_iter = rbegin(); info_iter != rend(); ++info_iter) {
@@ -497,7 +497,7 @@ namespace lsplt::inline v2 {
     constexpr static auto kMapEntry = 7;
     std::vector<MapInfo> info;
     auto path = "/proc/" + std::string{pid} + "/maps";
-    LOGW("Reading file %s is detectable by the process", path.c_str());
+    // LOGW("Reading file %s is detectable by the process", path.c_str());
     auto maps = std::unique_ptr<FILE, decltype(&fclose)>{fopen(path.c_str(), "r"), &fclose};
     if (maps) {
         char *line = nullptr;
