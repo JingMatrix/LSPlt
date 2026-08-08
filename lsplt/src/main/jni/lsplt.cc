@@ -280,13 +280,15 @@ public:
      *
      * Sequence of Operations (Referenced in Diagram B):
      * -------------------------------------------------
-     * 1. MREMAP: The original, file-backed memory segment at `0x7f1000` is atomically
-     *    moved to a new, kernel-selected address (`0xBAADF00D`). This becomes the backup.
-     *    The `HookInfo.backup` field records this new address.
+     * 1. MMAP & MEMCPY: A writable, private anonymous mapping is created at a scratch
+     *    address and populated from the still-intact original segment at `0x7f1000`.
      *
-     * 2. MMAP & MEMCPY: A new, writable, private anonymous mapping is created at the
-     *    original address (`0x7f1000`). Its contents are immediately populated by copying
-     *    the data from the backup segment.
+     * 2. MREMAP x2: The original, file-backed segment is atomically moved to a new,
+     *    kernel-selected address (`0xBAADF00D`) — recorded in `HookInfo.backup` — and the
+     *    prepared copy is immediately mremap'd into the address it vacated. Nothing may be
+     *    called between the two moves: while `0x7f1000` is a hole, any code in the process
+     *    that reaches this library's GOT would fault (see PatchPLTEntry for the arm32 case
+     *    where that is every __aeabi_mem* call).
      *
      * 3. OVERWRITE: With a writable copy now in place, the PLT entry for the target
      *    symbol ('read') is safely overwritten with the address of the user's callback.
@@ -309,32 +311,45 @@ public:
         if (info.end <= addr) return false;
         const auto len = info.end - info.start;
         if (!info.backup && !info.self) {
-            // let os find a suitable address
+            // Reserve a slot for the pristine image; PROT_NONE until mremap fills it in.
             auto *backup_addr = sys_mmap(nullptr, len, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
             LOGD("backup %p to %p", reinterpret_cast<void *>(addr), backup_addr);
             if (backup_addr == MAP_FAILED) return false;
-            if (auto *new_addr =
-                    sys_mremap(reinterpret_cast<void *>(info.start), len, len,
-                               MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP, backup_addr);
-                new_addr == MAP_FAILED || new_addr != backup_addr) {
-                new_addr = sys_mremap(reinterpret_cast<void *>(info.start), len, len,
-                                      MREMAP_FIXED | MREMAP_MAYMOVE, backup_addr);
-                if (new_addr == MAP_FAILED || new_addr != backup_addr) {
-                    return false;
-                }
-                LOGD("backup with MREMAP_DONTUNMAP failed, tried without it");
-            }
-            if (auto *new_addr = sys_mmap(reinterpret_cast<void *>(info.start), len,
-                                          PROT_READ | PROT_WRITE | info.perms,
-                                          MAP_PRIVATE | MAP_FIXED | MAP_ANON, -1, 0);
-                new_addr == MAP_FAILED) {
+
+            // Build the writable copy at a scratch address *before* the original mapping is
+            // disturbed. The window in which [info.start, info.end) is not backed by the correct
+            // data must contain no calls at all: the region we are replacing holds this library's
+            // .got/.got.plt, and on arm32 libandroid_runtime.so happens to export the process's
+            // only __aeabi_memcpy/__aeabi_memmove/__aeabi_memset (bionic keeps its own hidden),
+            // each of which is a bare `b <sym>@plt` through exactly that GOT. So while the region
+            // is a hole, an innocuous memcpy or log call anywhere in the process is fatal.
+            auto *copy_addr = sys_mmap(nullptr, len, PROT_READ | PROT_WRITE | info.perms,
+                                       MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (copy_addr == MAP_FAILED) {
+                sys_munmap(backup_addr, len);
                 return false;
             }
-            const uintptr_t page_size = getpagesize();
-            for (uintptr_t src = reinterpret_cast<uintptr_t>(backup_addr), dest = info.start,
-                           end = info.start + len;
-                 dest < end; src += page_size, dest += page_size) {
-                memcpy(reinterpret_cast<void *>(dest), reinterpret_cast<void *>(src), page_size);
+            memcpy(copy_addr, reinterpret_cast<void *>(info.start), len);
+
+            // Swap. Two raw syscalls back to back, nothing in between; MREMAP_DONTUNMAP is not
+            // used because the kernel rejects it for the file-backed mapping we always start
+            // from, and its fallback path is what opened the hole in the first place.
+            if (auto *new_addr = sys_mremap(reinterpret_cast<void *>(info.start), len, len,
+                                            MREMAP_FIXED | MREMAP_MAYMOVE, backup_addr);
+                new_addr == MAP_FAILED || new_addr != backup_addr) {
+                sys_munmap(copy_addr, len);
+                sys_munmap(backup_addr, len);
+                return false;
+            }
+            if (auto *new_addr = sys_mremap(copy_addr, len, len, MREMAP_FIXED | MREMAP_MAYMOVE,
+                                            reinterpret_cast<void *>(info.start));
+                new_addr == MAP_FAILED || reinterpret_cast<uintptr_t>(new_addr) != info.start) {
+                // Put the original back, otherwise the whole process dies on its next call
+                // through this library's PLT.
+                sys_mremap(backup_addr, len, len, MREMAP_FIXED | MREMAP_MAYMOVE,
+                           reinterpret_cast<void *>(info.start));
+                sys_munmap(copy_addr, len);
+                return false;
             }
             info.backup = reinterpret_cast<uintptr_t>(backup_addr);
         }
