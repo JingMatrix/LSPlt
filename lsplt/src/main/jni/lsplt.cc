@@ -178,17 +178,56 @@ public:
                 }
             }
         }
+        // A writable library segment's tail (.data/.bss, and sometimes .got.plt) can be COW'd or
+        // RELRO-split into a trailing ANONYMOUS mapping that /proc/maps no longer labels with the
+        // library path. It still belongs to that library, and a GOT relocation can land in it, so we
+        // absorb such an anonymous continuation under the preceding segment's identity to keep it
+        // hookable. (Seen on an Android 10 x86_64 emulator: libbinder's RW segment past its first page
+        // is anonymous, so the ioctl GOT sat in an anon page that was otherwise skipped and the hook
+        // silently failed.) `cont_*` track the running continuation of the last writable file segment.
+        uintptr_t cont_end = 0, cont_off = 0;
+        dev_t cont_dev = 0;
+        ino_t cont_inode = 0;
+        std::string cont_path;
         for (auto &map : maps) {
             // we basically only care about r-?p entry
             // and for offset == 0 it's an ELF header
             // and for offset != 0 it's what we hook
             // both of them should not be xom
-            if (!map.is_private || !(map.perms & PROT_READ) || map.path.empty() ||
-                map.path[0] == '[') {
+            const bool anon = map.path.empty() || map.path[0] == '[';
+            if (anon && map.is_private && (map.perms & PROT_READ) && (map.perms & PROT_WRITE) &&
+                cont_end != 0 && map.start == cont_end) {
+                const bool self = cont_inode == kSelfInode && cont_dev == kSelfDev;
+                HookInfo hi{{}, {}, 0, nullptr, self};
+                hi.start = map.start;
+                hi.end = map.end;
+                hi.perms = map.perms;
+                hi.is_private = true;
+                hi.offset = cont_off;
+                hi.dev = cont_dev;
+                hi.inode = cont_inode;
+                hi.path = cont_path;
+                cont_off += map.end - map.start;
+                cont_end = map.end;
+                info.emplace(hi.start, std::move(hi));
+                continue;
+            }
+            if (!map.is_private || !(map.perms & PROT_READ) || anon) {
+                cont_end = 0;  // break the continuation chain
                 continue;
             }
             auto start = map.start;
             const bool self = map.inode == kSelfInode && map.dev == kSelfDev;
+            // Remember a writable file-backed segment so a following anon page can continue it.
+            if (map.perms & PROT_WRITE) {
+                cont_end = map.end;
+                cont_off = map.offset + (map.end - map.start);
+                cont_dev = map.dev;
+                cont_inode = map.inode;
+                cont_path = map.path;
+            } else {
+                cont_end = 0;
+            }
             info.emplace(start, HookInfo{{std::move(map)}, {}, 0, nullptr, self});
         }
         return info;
