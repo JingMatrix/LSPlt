@@ -25,6 +25,7 @@ class Elf {
 
     ElfW(Addr) rel_android_ = 0;  // android compressed rel or rela
     ElfW(Word) rel_android_size_ = 0;
+    bool android_is_rela_ = false;
 
     // for ELF hash
     uint32_t *bucket_ = nullptr;

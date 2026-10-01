@@ -147,8 +147,13 @@ Elf::Elf(uintptr_t base_addr) : base_addr_(base_addr) {
         case DT_RELASZ:
             rel_dyn_size_ = dynamic->d_un.d_val;
             break;
-        case DT_ANDROID_REL:
+        case DT_ANDROID_REL: {
+            android_is_rela_ = false;
+            if (!SetByOffset(rel_android_, base_addr_, bias_addr_, dynamic->d_un.d_ptr)) return;
+            break;
+        }
         case DT_ANDROID_RELA: {
+            android_is_rela_ = true;
             if (!SetByOffset(rel_android_, base_addr_, bias_addr_, dynamic->d_un.d_ptr)) return;
             break;
         }
@@ -291,13 +296,88 @@ std::vector<uintptr_t> Elf::FindPltAddr(std::string_view name) const {
 
     for (const auto &[rel, rel_size, is_plt] :
          {std::make_tuple(rel_plt_, rel_plt_size_, true),
-          std::make_tuple(rel_dyn_, rel_dyn_size_, false),
-          std::make_tuple(rel_android_, rel_android_size_, false)}) {
+          std::make_tuple(rel_dyn_, rel_dyn_size_, false)}) {
         if (!rel) continue;
         if (is_use_rela_) {
             looper.template operator()<ElfW(Rela)>(rel, rel_size, is_plt);
         } else {
             looper.template operator()<ElfW(Rel)>(rel, rel_size, is_plt);
+        }
+    }
+
+    // DT_ANDROID_REL(A) is not an array of ElfW(Rel[a]). After the "APS2"
+    // header it is a stream of SLEB128 delta-encoded relocation groups. Treating
+    // those bytes as native relocation structs misses imports whose GLOB_DAT or
+    // ABS relocation lives only in the packed section (notably keystore2 on
+    // Android x86_64).
+    if (rel_android_ && rel_android_size_) {
+        const auto *cursor = reinterpret_cast<const uint8_t *>(rel_android_);
+        const auto *end = cursor + rel_android_size_;
+        bool ok = true;
+        auto pop_sleb128 = [&]() -> int64_t {
+            uint64_t value = 0;
+            unsigned shift = 0;
+            uint8_t byte = 0;
+            do {
+                if (cursor >= end || shift >= 64) {
+                    ok = false;
+                    return 0;
+                }
+                byte = *cursor++;
+                value |= static_cast<uint64_t>(byte & 0x7f) << shift;
+                shift += 7;
+            } while (byte & 0x80);
+            if (shift < 64 && (byte & 0x40)) value |= (~uint64_t{0}) << shift;
+            return static_cast<int64_t>(value);
+        };
+
+        constexpr uint64_t kGroupedByInfo = 1;
+        constexpr uint64_t kGroupedByOffsetDelta = 2;
+        constexpr uint64_t kGroupedByAddend = 4;
+        constexpr uint64_t kHasAddend = 8;
+
+        const int64_t encoded_count = pop_sleb128();
+        int64_t offset = pop_sleb128();
+        if (!ok || encoded_count < 0 || encoded_count > (1 << 24) || offset < 0) return res;
+
+        uint64_t remaining = static_cast<uint64_t>(encoded_count);
+        uint64_t info = 0;
+        int64_t addend = 0;
+        while (ok && remaining != 0) {
+            const int64_t encoded_group_size = pop_sleb128();
+            const int64_t encoded_flags = pop_sleb128();
+            if (!ok || encoded_group_size <= 0 || encoded_flags < 0 ||
+                static_cast<uint64_t>(encoded_group_size) > remaining) {
+                ok = false;
+                break;
+            }
+            const uint64_t group_size = static_cast<uint64_t>(encoded_group_size);
+            const uint64_t flags = static_cast<uint64_t>(encoded_flags);
+            if (!android_is_rela_ && (flags & kHasAddend)) {
+                ok = false;
+                break;
+            }
+            const int64_t grouped_offset_delta =
+                (flags & kGroupedByOffsetDelta) ? pop_sleb128() : 0;
+            if (flags & kGroupedByInfo) info = static_cast<uint64_t>(pop_sleb128());
+            if ((flags & kHasAddend) && (flags & kGroupedByAddend)) addend += pop_sleb128();
+
+            for (uint64_t i = 0; ok && i < group_size; ++i) {
+                offset += (flags & kGroupedByOffsetDelta) ? grouped_offset_delta : pop_sleb128();
+                if (!(flags & kGroupedByInfo)) info = static_cast<uint64_t>(pop_sleb128());
+                if ((flags & kHasAddend) && !(flags & kGroupedByAddend)) addend += pop_sleb128();
+                if (!ok || offset < 0) break;
+
+                const auto r_sym = ELF_R_SYM(info);
+                const auto r_type = ELF_R_TYPE(info);
+                if (r_sym == idx &&
+                    (r_type == ELF_R_GENERIC_ABS || r_type == ELF_R_GENERIC_GLOB_DAT)) {
+                    const auto addr = bias_addr_ + static_cast<uintptr_t>(offset);
+                    if (addr > base_addr_) res.emplace_back(addr);
+                }
+            }
+            if (!(flags & kHasAddend)) addend = 0;
+            remaining -= group_size;
         }
     }
 
